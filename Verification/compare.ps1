@@ -11,7 +11,9 @@ $dest = Resolve-Path -Path $dest
 $src = ($src -replace "\\$", "")
 $dest = ($dest -replace "\\$", "")
 
-$fileCount = 0
+$fileCountOk = 0
+$fileCountHashMismatch = 0
+$fileCountOtherError = 0
 $sourceData = $null
 if ($r) {
 	$sourceData = Get-ChildItem -Recurse $src | Where { ! $_.PSIsContainer } | Select Name,FullName,Extension,BaseName
@@ -34,19 +36,30 @@ $sourceData | Foreach-Object {
 
 	# Get the file hashes
 	$hashSrc = Get-FileHash $fullPath -Algorithm "SHA256"
-	$hashDest = Get-FileHash $fileToCheck.FullName -Algorithm "SHA256"
 
-	# Hash comparison
-	if ($hashSrc.Hash -ne $hashDest.Hash)
+	Try
+	{	
+		$hashDest = Get-FileHash $fileToCheck.FullName -Algorithm "SHA256"
+
+		# Hash comparison
+		if ($hashSrc.Hash -ne $hashDest.Hash)
+		{
+			Write-Output "ERR	Hash Mismatch   	$fullPath	$hashSrc	$hashDest"
+			$fileCountHashMismatch = $fileCountHashMismatch + 1
+		} else {
+			Write-Output "OK	                	$fullPath"
+			$fileCountOk = $fileCountOk + 1
+		}
+	}
+	Catch
 	{
-		Write-Output "ERR	$fullPath	$hashSrc	$hashDest"
-		$fileCount = $fileCount + 1
-	} else {
-		Write-Output "OK	$fullPath"
-		$fileCount = $fileCount + 1
+		Write-Output "ERR	Other Error    	$fullPath	$hashSrc"
+		$fileCountOtherError = $fileCountOtherError + 1
 	}
 }
 
 Write-Output ""
 Write-Output ""
-Write-Output "File Count: $fileCount"
+Write-Output "File Count OK: $fileCountOk"
+Write-Output "File Count Hash Mismatch: $fileCountHashMismatch"
+Write-Output "File Count Other Error: $fileCountOtherError"
