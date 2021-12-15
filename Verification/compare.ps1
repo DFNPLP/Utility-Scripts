@@ -31,14 +31,16 @@ $sourceData | Foreach-Object {
 	$regexForStrippingFileName = "\\?" + [regex]::Escape("$fileName") + "$"
 	$relativePathFromRoot = ($pathFromRoot -replace $regexForStrippingFileName, "")
 	
-	$destFileRegex = [regex]::Escape("$fileNameNoExt") + "( \(\d{4}_\d{2}_\d{2} \d{2}_\d{2}_\d{2} UTC\))?" + [regex]::Escape("$fileExt")
-	$fileToCheck = Get-ChildItem -Path "$dest\$relativePathFromRoot\" | Where-Object { $_.Name -match $destFileRegex}
 
-	# Get the file hashes
-	$hashSrc = Get-FileHash $fullPath -Algorithm "SHA256"
 
 	Try
 	{	
+		$destFileRegex = [regex]::Escape("$fileNameNoExt") + "( \(\d{4}_\d{2}_\d{2} \d{2}_\d{2}_\d{2} UTC\))?" + [regex]::Escape("$fileExt")
+		$fileToCheck = Get-ChildItem -Path "$dest\$relativePathFromRoot\" | Where-Object { $_.Name -match $destFileRegex}
+
+		# Get the file hashes
+		$hashSrc = Get-FileHash $fullPath -Algorithm "SHA256"
+	
 		$hashDest = Get-FileHash $fileToCheck.FullName -Algorithm "SHA256"
 
 		# Hash comparison
