@@ -1,0 +1,58 @@
+import copy
+
+
+class Fsm:
+
+    def __init__(self):
+        self._states_and_transitions = {}
+        self._next_state = None
+        self._next_state_data = None
+
+    def _state_exists(self, state_name):
+        return state_name in self._states_and_transitions
+
+    def register_state(self, state_name, default_transition_state_name, action, make_start_state=False):
+        if self._state_exists(state_name):
+            raise ValueError(f"{state_name} already registered!")
+        elif default_transition_state_name is not None and not self._state_exists(default_transition_state_name):
+            raise ValueError(f"{default_transition_state_name} not currently registered!")
+        elif not callable(action):
+            raise ValueError("Action provided must be callable.")
+
+        self._states_and_transitions[state_name] = (default_transition_state_name, action)
+
+        if make_start_state:
+            self._next_state = state_name
+
+    def execute_force_transition_to_state(self, transition_to_state, data=None, override_next_state=None):
+        if not self._state_exists(transition_to_state):
+            raise ValueError(f"{transition_to_state} doesn't exist!")
+        elif override_next_state is not None and not self._state_exists(override_next_state):
+            raise ValueError(f"{override_next_state} doesn't exist!")
+
+        next_state_candidate, action = self._states_and_transitions[transition_to_state]
+        if override_next_state is not None:
+            self._next_state = override_next_state
+        else:
+            self._next_state = next_state_candidate
+
+        self._next_state_data = action(data)
+
+        return copy.deepcopy(self._next_state_data)
+
+    def execute_next_state(self):
+        if self._next_state is None:
+            raise ValueError("No next state.")
+
+        transition_to_state, action = self._states_and_transitions[self._next_state]
+
+        self._next_state_data = action(self._next_state_data)
+
+        return copy.deepcopy(self._next_state_data)
+
+    def set_next_state_but_do_not_execute(self, transition_to_state):
+        self._next_state = transition_to_state
+        self._next_state_data = None
+
+    def get_next_state(self):
+        return self._next_state

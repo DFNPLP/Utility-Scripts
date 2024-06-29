@@ -4,18 +4,100 @@ import os
 import sqlite3
 import hashlib
 
-DEFAULT_DB_FILE_NAME = "data_cache"
+STATUS_TABLE_NAME = "status"
+STATUS_TABLE_VERSION_FIELD = "app_version"
+STATUS_TABLE_SOURCE_PATH_FIELD = "root_source_path"
+STATUS_TABLE_TARGET_PATH_FIELD = "root_target_path"
+STATUS_TABLE_FOLLOW_SYMLINKS_FIELD = "follow_symlinks"
+STATUS_TABLE_COMPLETE_FIELD = "complete"
+STATUS_TABLE_STARTED_FIELD = "started"
+STATUS_TABLE_ID_FIELD = "id"
+
+SOURCE_FILES_TABLE_NAME = "source_files"
+TARGET_FILES_TABLE_NAME = "target_files"
+FILES_TABLES_ID_FIELD = "id"
+FILES_TABLES_HASH_FIELD = "hash"
+FILES_TABLES_PATH_FIELD = "path"
+
+TIMESTAMP_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+APP_VERSION_MAJOR = 1
+APP_VERSION_MINOR = 0
+APP_VERSION_PATCH = 0
+
+SHA_256_SUM_EMPTY_FILE_HASH = b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
-def main():
-    pass
+def check_db_status(client):
+    is_compatible_version_or_irrelevant, previous_exists, completed, timestamp = False, False, False, None
+    root_source_path, root_target_path, follow_symlinks = None, None, False
+    cursor = client.execute(f"SELECT {STATUS_TABLE_VERSION_FIELD} FROM {STATUS_TABLE_NAME} LIMIT 1;")
+    results = cursor.fetchall()
+    previous_exists = len(results) > 0
+
+    if previous_exists:
+        is_compatible_version_or_irrelevant = results[0][0] == APP_VERSION_MAJOR
+
+        results = client.execute(f"SELECT TOP 1 {STATUS_TABLE_COMPLETE_FIELD}, {STATUS_TABLE_STARTED_FIELD}, "
+                                 f"{STATUS_TABLE_SOURCE_PATH_FIELD}, {STATUS_TABLE_TARGET_PATH_FIELD}, "
+                                 f"{STATUS_TABLE_FOLLOW_SYMLINKS_FIELD} FROM {STATUS_TABLE_NAME};")
+        if len(results) > 0:
+            completed, timestamp, root_source_path, root_target_path, follow_symlinks = results[0]
+
+    return is_compatible_version_or_irrelevant, previous_exists, completed, timestamp, \
+        root_source_path, root_target_path, follow_symlinks
 
 
-def walk_directories_and_subdirectories(directory, db_client, db_connection, checked_directories, table_name):
+def setup_db_tables_non_destructively(connection, client):
+    client.execute(
+        f"CREATE TABLE IF NOT EXISTS {SOURCE_FILES_TABLE_NAME} "
+        f"({FILES_TABLES_ID_FIELD} INTEGER PRIMARY KEY AUTOINCREMENT, "
+        f"{FILES_TABLES_HASH_FIELD} BLOB, "
+        f"{FILES_TABLES_PATH_FIELD} VARCHAR);"
+    )
+
+    client.execute(
+        f"CREATE TABLE IF NOT EXISTS {TARGET_FILES_TABLE_NAME} "
+        f"({FILES_TABLES_ID_FIELD} INTEGER PRIMARY KEY AUTOINCREMENT, "
+        f"{FILES_TABLES_HASH_FIELD} BLOB, "
+        f"{FILES_TABLES_PATH_FIELD} VARCHAR);"
+    )
+
+    client.execute(
+        f"CREATE TABLE IF NOT EXISTS {STATUS_TABLE_NAME} "
+        f"({STATUS_TABLE_ID_FIELD} INTEGER PRIMARY KEY AUTOINCREMENT, {STATUS_TABLE_COMPLETE_FIELD} BOOL, "
+        f"{STATUS_TABLE_STARTED_FIELD} TIMESTAMP, {STATUS_TABLE_SOURCE_PATH_FIELD} VARCHAR, "
+        f"{STATUS_TABLE_TARGET_PATH_FIELD} VARCHAR, {STATUS_TABLE_FOLLOW_SYMLINKS_FIELD} BOOL, "
+        f"{STATUS_TABLE_VERSION_FIELD} VARCHAR);"
+    )
+
+    connection.commit()
+
+
+def totally_reset_db(connection, client):
+    client.execute(f"DROP TABLE {SOURCE_FILES_TABLE_NAME};")
+
+    client.execute(f"DROP TABLE {TARGET_FILES_TABLE_NAME};")
+
+    client.execute(f"DROP TABLE {STATUS_TABLE_NAME};")
+
+    setup_db_tables_non_destructively(connection, client)
+
+    connection.commit()
+
+
+def walk_directories_and_subdirectories(
+        directory,
+        db_client,
+        db_connection,
+        checked_directories,
+        table_name,
+        follow_symlinks
+):
     if os.path.join(directory) in checked_directories:
         return checked_directories
 
-    for current_root_path, directory_names, file_names in os.walk(directory, followlinks=True):
+    for current_root_path, directory_names, file_names in os.walk(directory, followlinks=follow_symlinks):
         checked_directories.add(current_root_path)
 
         for name in file_names:
@@ -30,10 +112,11 @@ def walk_directories_and_subdirectories(directory, db_client, db_connection, che
                     hasher.update(file_data)
                 print(f"Inserting ({hasher.digest()}, '{file_path}')")
                 insert_result = db_client.execute(
-                    f"INSERT INTO {table_name} (hash, path) VALUES (zeroblob(32), ?)",
+                    f"INSERT INTO {table_name} ({FILES_TABLES_HASH_FIELD}, {FILES_TABLES_PATH_FIELD}) "
+                    f"VALUES (zeroblob(32), ?)",
                     (file_path,)
                 )
-                with db_connection.blobopen(table_name, "hash", insert_result.lastrowid) as blob:
+                with db_connection.blobopen(table_name, FILES_TABLES_HASH_FIELD, insert_result.lastrowid) as blob:
                     blob.write(hasher.digest())
         db_connection.commit()
 
@@ -48,6 +131,52 @@ def walk_directories_and_subdirectories(directory, db_client, db_connection, che
     return checked_directories
 
 
+def get_files_not_present_in_target_but_present_in_source(db_client):
+    """
+    Note: this excludes empty files
+    :param db_client:
+    :return:
+    """
+    data = []
+
+    for item in db_client.execute(f"SELECT * FROM {SOURCE_FILES_TABLE_NAME} "
+                                  f"NOT IN (SELECT {FILES_TABLES_HASH_FIELD} FROM {TARGET_FILES_TABLE_NAME})"):
+                                  # f"WHERE {FILES_TABLES_HASH_FIELD} = {SHA_256_SUM_EMPTY_FILE_HASH} "
+                                  # f"AND {FILES_TABLES_HASH_FIELD} "
+                                  # f"NOT IN SELECT {FILES_TABLES_HASH_FIELD} FROM {TARGET_FILES_TABLE_NAME}"):
+        data.append(item)
+
+    return data
+
+
+def get_empty_target_files(db_client):
+    """
+    :param db_client:
+    :return:
+    """
+    data = []
+
+    for item in db_client.execute(f"SELECT * FROM {TARGET_FILES_TABLE_NAME}"
+                                  f" WHERE {FILES_TABLES_HASH_FIELD} = {SHA_256_SUM_EMPTY_FILE_HASH} "):
+        data.append(item)
+
+    return data
+
+
+def get_empty_source_files(db_client):
+    """
+    :param db_client:
+    :return:
+    """
+    data = []
+
+    for item in db_client.execute(f"SELECT * FROM {SOURCE_FILES_TABLE_NAME}"
+                                  f" WHERE {FILES_TABLES_HASH_FIELD} = {SHA_256_SUM_EMPTY_FILE_HASH} "):
+        data.append(item)
+
+    return data
+
+
 def split_string_or_return_empty_list(string_to_split):
     try:
         return string_to_split.split(",")
@@ -55,119 +184,20 @@ def split_string_or_return_empty_list(string_to_split):
         return []
 
 
-def verify_files_folders_are_reachable(paths_list):
-    valid_directory_paths, invalid_directory_paths = [], {}
-    for item in paths_list:
-        if os.path.isdir(item):
-            valid_directory_paths.append(item)
-        else:
-            current_error = invalid_directory_paths.get(item, "")
-            if os.path.exists(item):
-                current_error += f"{item} does not exist on the current file system."
-            else:
-                current_error += f"{item} is not a directory."
-            invalid_directory_paths[item] = current_error
-
-    return valid_directory_paths, invalid_directory_paths
-
-
-def request_paths(reason):
-    new_paths = input(f"Please provide a single path for {reason}. ")
-    new_paths_list = split_string_or_return_empty_list(new_paths)
-
-    while not new_paths_list:
-        new_paths = input(f"Sorry, that input wasn't understood. Please provide a single path for {reason}. ")
-        new_paths_list = split_string_or_return_empty_list(new_paths)
-
-    return new_paths_list
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        prog="DeepFolderFileHashComparison",
-        description="Allows you to index files by hash in on-disk/in-memory database and "
-                    "compare that to another folder."
-    )
-
-    parser.add_argument(
-        '-d',
-        '--db_name',
-        action='store',
-        dest="db_name",
-        default=DEFAULT_DB_FILE_NAME
-    )
-
-    parser.add_argument(
-        '-s',
-        '--source',
-        action='store',
-        dest="source",
-        default=None
-    )
-
-    parser.add_argument(
-        '-t',
-        '--target',
-        action='store',
-        dest="target",
-        default=None
-    )
-
-    args = parser.parse_args()
-
-    db_name = args.db_name if args.db_name else DEFAULT_DB_FILE_NAME
-    db_connection = sqlite3.connect(f"{DEFAULT_DB_FILE_NAME}.db")
-    client = db_connection.cursor()
-
-    client.execute(
-        "CREATE TABLE IF NOT EXISTS source_files "
-        "(id INTEGER PRIMARY KEY AUTOINCREMENT, hash BLOB, path VARCHAR);"
-    )
-
-    client.execute(
-        "CREATE TABLE IF NOT EXISTS target_files "
-        "(id INTEGER PRIMARY KEY AUTOINCREMENT, hash BLOB, path VARCHAR);"
-    )
-
-    # client.execute(f"INSERT INTO files VALUES (0, 'c:/fake_file', '{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}')")
-    # um = client.execute(f"SELECT * FROM files")
-    # for item in um:
-    #     print(item)
-    #
-    # client.execute(
-    #     f"DROP TABLE files;")
-
-    for table_name, incoming_path, reason in \
-            [("source_files", args.source, "source file checks"), ("target_files", args.target, "target file checks")]:
-        paths_list = split_string_or_return_empty_list(incoming_path)
-        if not paths_list or len(paths_list) != 1:
-            paths_list = request_paths(reason)
-        valid_paths, errors = verify_files_folders_are_reachable(paths_list)
-
-        while errors or not valid_paths or len(valid_paths) != 1:
-            print(f"There are either errors present or a number of paths which is not 1. Errors: {errors}")
-            paths_list = request_paths(reason)
-            valid_paths, errors = verify_files_folders_are_reachable(paths_list)
-
-        checked_directories = set()
-        for item in paths_list:
-            checked_directories = walk_directories_and_subdirectories(
-                item,
-                client,
-                db_connection,
-                checked_directories,
-                table_name
-            )
-
-    for item in client.execute("SELECT * FROM source_files WHERE hash NOT IN (SELECT hash FROM target_files)"):
-        print(item)
+def verify_files_folders_are_reachable(path):
+    if path is None:
+        return False, "Path is None."
+    elif os.path.isdir(path):
+        return True, None
+    elif not os.path.exists(path):
+        return False, f"{path} does not exist on the current file system."
+    else:
+        return False, f"{path} is not a directory."
 
 # todo, need to add warnings for empty files will not appear in list
-# hex hash for empty file: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 
-    # todo, need to multithread work on hashing
+# todo, need to multithread work on hashing
+# todo include option to ignore symlinks
+# todo, need to to track completions in another table...check versions as as part of open to make sure all is okay
 
-
-    #todo, figure out comparison interactions....also, what happens if old and new file caches are mixed?
-    #todo, figue out how to specify file name of db
-    # todo, give tools to inspect DB contents, compare old DB contents
+# todo, should I let people checkpoint the DB and force a resume if they know files haven't changed? I think so, just with a warning.
