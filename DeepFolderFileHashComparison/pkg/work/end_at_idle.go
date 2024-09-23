@@ -1,7 +1,5 @@
 package work
 
-//todo, is the name of this file gothonic?
-
 import (
 	"context"
 	"errors"
@@ -11,34 +9,12 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-type command int
-type WorkItem func() error
-
-const (
-	EXIT command = iota
-)
-
-type readOnlyWaitGroup struct {
-	waitGroup *sync.WaitGroup
-}
-
-func NewReadOnlyCond(waitGroup *sync.WaitGroup) (*readOnlyWaitGroup, error) {
-	if waitGroup == nil {
-		return nil, errors.New("waitGroup must not be nil")
-	}
-
-	return &readOnlyWaitGroup{waitGroup: waitGroup}, nil
-}
-
-func (roc *readOnlyWaitGroup) Wait() {
-	roc.waitGroup.Wait()
-}
-
 type endAtIdleWorkQueue struct {
-	workerCount            int64
-	workBacklog            []WorkItem
-	workBacklogMutex       sync.Mutex // used to sync writes to the sharedWorkQueue, ensures that go routines can't fill the channel buffer and deadlock
-	sharedWorkQueue        chan WorkItem
+	workerCount int64
+	queuer      *queuer
+	//todo, get these two queues from the queuer
+	queuerToWorkerQueue    chan WorkItem
+	queuerQueue            chan WorkItem
 	sharedCommandQueue     chan command
 	mightBeCompleteQueue   chan struct{}
 	activeWorkersSemaphore semaphore.Weighted
@@ -49,18 +25,10 @@ type endAtIdleWorkQueue struct {
 	errorWriteMutex  sync.Mutex
 }
 
-type WorkQueue interface {
-	QueueWork(workItem WorkItem) error
-	Start() (*readOnlyWaitGroup, error)
-	GetErrors() []error
-}
-
-// workerCount+1 watcher will be the number of go routines spawned for the work, setting enableWorkBacklog to true will slow down work but will prevent deadlocks if the queue size was selected to be too small
-func NewEndAtIdleWorkQueue(workerCount int64, queueSize int64, enableWorkBacklog bool, gatherErrors bool, logger *slog.Logger) (*endAtIdleWorkQueue, error) {
+// workerCount+1 watcher+1 queue thread + 1 backlog thread (handling overflows so there are no deadlocks) will be the number of go routines spawned for the work
+func NewEndAtIdleWorkQueue(workerCount int64, gatherErrors bool, logger *slog.Logger) (*endAtIdleWorkQueue, error) {
 	if workerCount < 1 {
 		return nil, errors.New("workers must be at least 1")
-	} else if queueSize < 1 || queueSize < workerCount {
-		return nil, errors.New("queue size must be at least 1 and at least the size of the number of worker threads")
 	} else if logger == nil {
 		return nil, errors.New("logger must not be nil")
 	}
@@ -70,16 +38,17 @@ func NewEndAtIdleWorkQueue(workerCount int64, queueSize int64, enableWorkBacklog
 		gatheredErrorsSlice = make([]error, 0)
 	}
 
-	var workBacklogSlice []WorkItem = nil
-	if enableWorkBacklog {
-		workBacklogSlice = make([]WorkItem, 0)
-	}
+	queuerToWorkerQueue := make(chan WorkItem)
+	queuerQueue := make(chan WorkItem)
+
+	queuer := NewQueuer(queuerToWorkerQueue, queuerQueue)
+	queuer.Start()
 
 	return &endAtIdleWorkQueue{
 		workerCount:            workerCount,
-		workBacklog:            workBacklogSlice,
-		workBacklogMutex:       sync.Mutex{},
-		sharedWorkQueue:        make(chan WorkItem, queueSize),
+		queuer:                 queuer,
+		queuerToWorkerQueue:    queuerToWorkerQueue,
+		queuerQueue:            queuerQueue,
 		sharedCommandQueue:     make(chan command, workerCount),
 		mightBeCompleteQueue:   make(chan struct{}, workerCount),
 		activeWorkersSemaphore: *semaphore.NewWeighted(workerCount),
@@ -108,59 +77,8 @@ func (eaiwq *endAtIdleWorkQueue) IsRecordingErrors() bool {
 	return eaiwq.gathereredErrors != nil
 }
 
-func (eaiwq *endAtIdleWorkQueue) WorkBacklogEnabled() bool {
-	// the fact that there's a non-nil slice here at all means we're gathering errors
-	return eaiwq.workBacklog != nil
-}
-
 func (eaiwq *endAtIdleWorkQueue) QueueWork(workItem WorkItem) {
-	//todo....should I have a context timeout and shove something in the backlog if the timeout crosses to keep threads moving quickly rather than just letting one thread plug along when the backlog is enabled like I have?
-	//that would allow me to make the channel unbuffered and then deadlock issues disappear entirely? (not context actually, just unbuffered....) or would doing that lead to the possibility that everyone is waiting to publish to the backlog and we still hang up?
-	// maybe every worker has their own backlog, and a worker can issue a rebalance command to send work to their own backlog?
-	//maybe I just want a queuer object that will write the next element to the
-	eaiwq.queueWork(workItem, true)
-}
-
-// not exported function that allows for skipping of acquiring a lock if the workBacklogMutex lock is already acquired
-// you MUST send a false value for acquireWorkBacklogMutex if the lock is acquired and the work backlog is enabled
-func (eaiwq *endAtIdleWorkQueue) queueWork(workItem WorkItem, acquireWorkBacklogMutex bool) {
-	workBacklogEnabled := eaiwq.WorkBacklogEnabled()
-
-	if workBacklogEnabled && acquireWorkBacklogMutex {
-		eaiwq.workBacklogMutex.Lock()
-		defer eaiwq.workBacklogMutex.Unlock()
-	}
-
-	if workBacklogEnabled && len(eaiwq.sharedWorkQueue)+1 > cap(eaiwq.sharedWorkQueue) {
-		//todo, fix this so you can turn off the warning
-		eaiwq.logger.Warn("queueing work to backlog because of limited channel size, consider increasing the queue size or number of workers")
-		eaiwq.workBacklog = append(eaiwq.workBacklog, workItem)
-	} else {
-		eaiwq.sharedWorkQueue <- workItem
-	}
-}
-
-func (eaiwq *endAtIdleWorkQueue) pullItemsFromBacklogAndQueue() bool {
-	if !eaiwq.WorkBacklogEnabled() {
-		return false
-	}
-	eaiwq.workBacklogMutex.Lock()
-	defer eaiwq.workBacklogMutex.Unlock()
-
-	potentiallyRunningWorkers := eaiwq.workerCount - 1
-	// see how much room we have left in the channel, take into account the potential of workers that are still running and stuffing data into the channel
-	availableSpace := int64(cap(eaiwq.sharedWorkQueue)) - potentiallyRunningWorkers - int64(len(eaiwq.workBacklog))
-
-	if availableSpace > 0 {
-		startIndx := int64(len(eaiwq.workBacklog)) - availableSpace
-		for indx := startIndx; indx < int64(len(eaiwq.workBacklog)); indx++ {
-			eaiwq.sharedWorkQueue <- eaiwq.workBacklog[indx]
-		}
-		eaiwq.workBacklog = eaiwq.workBacklog[:startIndx]
-		return true
-	} else {
-		return false
-	}
+	eaiwq.queuerQueue <- workItem
 }
 
 func (eaiwq *endAtIdleWorkQueue) queueAllExits(force bool) bool {
@@ -168,7 +86,7 @@ func (eaiwq *endAtIdleWorkQueue) queueAllExits(force bool) bool {
 	if acquiredSemaphore {
 		defer eaiwq.activeWorkersSemaphore.Release(eaiwq.workerCount)
 	}
-	if (acquiredSemaphore && len(eaiwq.sharedWorkQueue) < 1) || force {
+	if (acquiredSemaphore && eaiwq.queuer.GetApproximateItemsInBacklog() < 1) || force {
 		for count := int64(0); count < eaiwq.workerCount; count++ {
 			eaiwq.sharedCommandQueue <- EXIT
 		}
@@ -196,7 +114,8 @@ func (eaiwq *endAtIdleWorkQueue) processItemFromQueue(workerIndex int64, itemFro
 		}
 	}
 
-	itemsInQueue := len(eaiwq.sharedWorkQueue)
+	//todo, make queuer an object?
+	itemsInQueue := eaiwq.queuer.GetApproximateItemsInBacklog()
 	eaiwq.logger.Debug("approx items in queue", "workerIndex", workerIndex, "itemsInQueue", itemsInQueue)
 	if itemsInQueue <= 0 {
 		eaiwq.logger.Debug("signaling all work might be complete", "workerIndex", workerIndex)
@@ -208,9 +127,10 @@ func (eaiwq *endAtIdleWorkQueue) processItemFromQueue(workerIndex int64, itemFro
 func (eaiwq *endAtIdleWorkQueue) Start() (*readOnlyWaitGroup, error) {
 	acquiredSemaphore := eaiwq.activeWorkersSemaphore.TryAcquire(eaiwq.workerCount)
 	defer eaiwq.activeWorkersSemaphore.Release(eaiwq.workerCount)
-	isRunning := !acquiredSemaphore || (acquiredSemaphore && len(eaiwq.sharedWorkQueue) < 1)
+	// isRunning := !acquiredSemaphore || (acquiredSemaphore && eaiwq.queuer.GetApproximateItemsInBacklog() < 1)
 
-	if isRunning {
+	// if isRunning {
+	if !acquiredSemaphore {
 		return nil, errors.New("cannot start work while work is running")
 	}
 
@@ -243,7 +163,7 @@ func (eaiwq *endAtIdleWorkQueue) Start() (*readOnlyWaitGroup, error) {
 						eaiwq.logger.Debug("worker exiting as a fallback default action", "workerIndex", workerIndex)
 						return
 					}
-				case itemFromQueue := <-eaiwq.sharedWorkQueue:
+				case itemFromQueue := <-eaiwq.queuerToWorkerQueue:
 					eaiwq.processItemFromQueue(workerIndex, itemFromQueue)
 				}
 			}

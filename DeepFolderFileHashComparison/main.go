@@ -109,7 +109,7 @@ func main() {
 	}
 
 	//todo, how can I prevent a deadlock if queue size is reached? maybe dump output to DB and allow a continuation? Maybe allow offloading of queue into another object or a DB interface?
-	workerQueue, err := work.NewEndAtIdleWorkQueue(workerThreads, queueSize, gatherErrors, logger)
+	workerQueue, err := work.NewEndAtIdleWorkQueue(workerThreads, gatherErrors, logger)
 	if err != nil {
 		logger.Error("issue creating worker queue", "error", err)
 		return
@@ -122,7 +122,7 @@ func main() {
 	//add item to work queue and mark it as visited
 	queuedOrVisitedSet[cleanedPath] = struct{}{}
 
-	err = workerQueue.QueueWork(
+	workerQueue.QueueWork(
 		//todo, rework the order of these args?
 		getNextWorkItem(
 			&HashData{FileInfo: rootFolderInfo, Path: cleanedPath},
@@ -133,10 +133,6 @@ func main() {
 			logger,
 		),
 	)
-	if err != nil {
-		logger.Error("issue queuing work item", "error", err)
-		return
-	}
 
 	completeCond, err := workerQueue.Start()
 	if err != nil {
@@ -201,7 +197,7 @@ func getNextWorkItem(
 					queuedOrVisitedSet[fullPath] = struct{}{}
 
 					//todo, handle errors
-					err = workQueue.QueueWork(
+					workQueue.QueueWork(
 						getNextWorkItem(
 							&HashData{FileInfo: folderInfo, Path: fullPath},
 							workQueue,
@@ -211,9 +207,6 @@ func getNextWorkItem(
 							logger,
 						),
 					)
-					if err != nil {
-						panic(err)
-					}
 					if d.IsDir() {
 						returnValue = filepath.SkipDir
 					}
