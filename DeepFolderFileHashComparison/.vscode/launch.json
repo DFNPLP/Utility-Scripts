@@ -1,0 +1,18 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Package",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${fileDirname}",
+            // "args": ["--path=C:/Users/Aaron Parks-Young/Desktop", "--workers=6"]
+            "args": ["--frompath=C:/Users/Aaron Parks-Young/Desktop/Random Stuff", "--topath=\\\\PetuniaPot/Shared Misc/Media/Photos/Aaron's Pixel 6 Pro", "--workers=5"]
+            //"args": ["--path=C:/Users/Aaron Parks-Young/Desktop/TestSimulcrum", "--workers=6"]
+        }
+    ]
+}

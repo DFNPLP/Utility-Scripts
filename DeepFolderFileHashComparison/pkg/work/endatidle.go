@@ -10,11 +10,9 @@ import (
 )
 
 type endAtIdleWorkQueue struct {
-	workerCount int64
-	queuer      *queuer
-	//todo, get these two queues from the queuer
-	queuerToWorkerQueue    chan WorkItem
-	queuerQueue            chan WorkItem
+	workerCount            int64
+	queuer                 *queuer
+	isRunningMutex         sync.Mutex
 	sharedCommandQueue     chan command
 	mightBeCompleteQueue   chan struct{}
 	activeWorkersSemaphore semaphore.Weighted
@@ -38,17 +36,13 @@ func NewEndAtIdleWorkQueue(workerCount int64, gatherErrors bool, logger *slog.Lo
 		gatheredErrorsSlice = make([]error, 0)
 	}
 
-	queuerToWorkerQueue := make(chan WorkItem)
-	queuerQueue := make(chan WorkItem)
-
-	queuer := NewQueuer(queuerToWorkerQueue, queuerQueue)
+	queuer := NewQueuer()
 	queuer.Start()
 
 	return &endAtIdleWorkQueue{
 		workerCount:            workerCount,
 		queuer:                 queuer,
-		queuerToWorkerQueue:    queuerToWorkerQueue,
-		queuerQueue:            queuerQueue,
+		isRunningMutex:         sync.Mutex{},
 		sharedCommandQueue:     make(chan command, workerCount),
 		mightBeCompleteQueue:   make(chan struct{}, workerCount),
 		activeWorkersSemaphore: *semaphore.NewWeighted(workerCount),
@@ -78,7 +72,7 @@ func (eaiwq *endAtIdleWorkQueue) IsRecordingErrors() bool {
 }
 
 func (eaiwq *endAtIdleWorkQueue) QueueWork(workItem WorkItem) {
-	eaiwq.queuerQueue <- workItem
+	eaiwq.queuer.inboundWorkChannel <- workItem
 }
 
 func (eaiwq *endAtIdleWorkQueue) queueAllExits(force bool) bool {
@@ -114,7 +108,6 @@ func (eaiwq *endAtIdleWorkQueue) processItemFromQueue(workerIndex int64, itemFro
 		}
 	}
 
-	//todo, make queuer an object?
 	itemsInQueue := eaiwq.queuer.GetApproximateItemsInBacklog()
 	eaiwq.logger.Debug("approx items in queue", "workerIndex", workerIndex, "itemsInQueue", itemsInQueue)
 	if itemsInQueue <= 0 {
@@ -125,13 +118,11 @@ func (eaiwq *endAtIdleWorkQueue) processItemFromQueue(workerIndex int64, itemFro
 }
 
 func (eaiwq *endAtIdleWorkQueue) Start() (*readOnlyWaitGroup, error) {
-	acquiredSemaphore := eaiwq.activeWorkersSemaphore.TryAcquire(eaiwq.workerCount)
-	defer eaiwq.activeWorkersSemaphore.Release(eaiwq.workerCount)
-	// isRunning := !acquiredSemaphore || (acquiredSemaphore && eaiwq.queuer.GetApproximateItemsInBacklog() < 1)
-
-	// if isRunning {
-	if !acquiredSemaphore {
+	lockAcquired := eaiwq.isRunningMutex.TryLock()
+	if !lockAcquired {
 		return nil, errors.New("cannot start work while work is running")
+	} else {
+		defer eaiwq.isRunningMutex.Unlock()
 	}
 
 	eaiwq.completeSignaler.Add(1)
@@ -163,7 +154,7 @@ func (eaiwq *endAtIdleWorkQueue) Start() (*readOnlyWaitGroup, error) {
 						eaiwq.logger.Debug("worker exiting as a fallback default action", "workerIndex", workerIndex)
 						return
 					}
-				case itemFromQueue := <-eaiwq.queuerToWorkerQueue:
+				case itemFromQueue := <-eaiwq.queuer.outboundWorkChannel:
 					eaiwq.processItemFromQueue(workerIndex, itemFromQueue)
 				}
 			}
