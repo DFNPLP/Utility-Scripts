@@ -36,12 +36,12 @@ $sourceData | Foreach-Object {
 	Try
 	{	
 		$destFileRegex = [regex]::Escape("$fileNameNoExt") + "( \(\d{4}_\d{2}_\d{2} \d{2}_\d{2}_\d{2} UTC\))?" + [regex]::Escape("$fileExt")
-		$fileToCheck = Get-ChildItem -Path "$dest\$relativePathFromRoot\" | Where-Object { $_.Name -match $destFileRegex}
+		$fileToCheck = Get-ChildItem -LiteralPath "$dest\$relativePathFromRoot\" | Where-Object { $_.Name -match $destFileRegex}
 
 		# Get the file hashes
-		$hashSrc = Get-FileHash $fullPath -Algorithm "SHA256"
+		$hashSrc = Get-FileHash -LiteralPath $fullPath -Algorithm "SHA256"
 	
-		$hashDest = Get-FileHash $fileToCheck.FullName -Algorithm "SHA256"
+		$hashDest = Get-FileHash -LiteralPath $fileToCheck.FullName -Algorithm "SHA256"
 
 		# Hash comparison
 		if ($hashSrc.Hash -ne $hashDest.Hash)
@@ -56,6 +56,7 @@ $sourceData | Foreach-Object {
 	Catch
 	{
 		Write-Output "ERR	Other Error    	$fullPath	$hashSrc"
+		Write-Output "DESC	Error Description	$($_.Exception.Message)	$($Error[0].ScriptStackTrace)"
 		$fileCountOtherError = $fileCountOtherError + 1
 	}
 }
